@@ -4,7 +4,6 @@ defmodule ExLogdrain.Repo do
 
   @db_path Path.expand("storage/logs.duckdb", File.cwd!())
 
-  # Export to Parquet every 2 minutes instead of on every batch write
   @export_interval :timer.minutes(2)
   @cleanup_interval :timer.hours(24)
 
@@ -12,7 +11,6 @@ defmodule ExLogdrain.Repo do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @doc "Asynchronously writes a batch of memory items straight through the alive connection"
   def insert_batch(logs) do
     GenServer.cast(__MODULE__, {:insert_batch, logs})
   end
@@ -32,22 +30,47 @@ defmodule ExLogdrain.Repo do
     {:ok, _} = Duckdbex.query(conn, "SET autoinstall_known_extensions=1;")
     {:ok, _} = Duckdbex.query(conn, "SET autoload_known_extensions=1;")
 
-    # Tables auto-commit by default. No need for Duckdbex.commit/1 here.
     {:ok, _result_ref} =
       Duckdbex.query(
         conn,
         """
         CREATE TABLE IF NOT EXISTS vercel_logs (
           id VARCHAR,
-          team_id VARCHAR,
+          deployment_id VARCHAR,
+          source VARCHAR,
+          host VARCHAR,
+          timestamp BIGINT,
+          project_id VARCHAR,
+          level VARCHAR,
           message VARCHAR,
-          runtime VARCHAR
+          project_name VARCHAR,
+          build_id VARCHAR,
+          type VARCHAR,
+          entrypoint VARCHAR,
+          request_id VARCHAR,
+          status_code INTEGER,
+          path VARCHAR,
+          execution_region VARCHAR,
+          environment VARCHAR,
+          trace_id VARCHAR,
+          span_id VARCHAR,
+          proxy_timestamp BIGINT,
+          proxy_method VARCHAR,
+          proxy_host VARCHAR,
+          proxy_path VARCHAR,
+          proxy_user_agent VARCHAR,
+          proxy_referer VARCHAR,
+          proxy_region VARCHAR,
+          proxy_status_code INTEGER,
+          proxy_client_ip VARCHAR,
+          proxy_scheme VARCHAR,
+          proxy_vercel_cache VARCHAR,
+          inserted_at TIMESTAMPTZ
         );
         """
         |> String.trim()
       )
 
-    # Schedule the recurring background Parquet snapshot
     schedule_parquet_export()
     schedule_database_cleanup()
 
@@ -68,12 +91,46 @@ defmodule ExLogdrain.Repo do
     try do
       {:ok, appender} = Duckdbex.appender(conn, "vercel_logs")
 
+      now = DateTime.utc_now()
+
       Enum.each(logs, fn log ->
-        :ok = Duckdbex.appender_add_row(appender, [log.id, log.team_id, log.message, log.runtime])
+        :ok =
+          Duckdbex.appender_add_row(appender, [
+            log.id,
+            log.deployment_id,
+            log.source,
+            log.host,
+            log.timestamp,
+            log.project_id,
+            log.level,
+            log.message,
+            log.project_name,
+            log.build_id,
+            log.type,
+            log.entrypoint,
+            log.request_id,
+            log.status_code,
+            log.path,
+            log.execution_region,
+            log.environment,
+            log.trace_id,
+            log.span_id,
+            log.proxy_timestamp,
+            log.proxy_method,
+            log.proxy_host,
+            log.proxy_path,
+            log.proxy_user_agent,
+            log.proxy_referer,
+            log.proxy_region,
+            log.proxy_status_code,
+            log.proxy_client_ip,
+            log.proxy_scheme,
+            log.proxy_vercel_cache,
+            now
+          ])
       end)
 
       :ok = Duckdbex.appender_flush(appender)
-      # Closing the appender immediately flushes metadata changes cleanly
       :ok = Duckdbex.appender_close(appender)
     rescue
       e -> Logger.error("Critical: Disk writer operation aborted: #{inspect(e)}")
@@ -98,8 +155,7 @@ defmodule ExLogdrain.Repo do
         conn,
         """
           COPY (
-            SELECT id, team_id, message, runtime, inserted_at
-            FROM vercel_logs
+            SELECT * FROM vercel_logs
             WHERE CAST(inserted_at AS DATE) = '#{today_str}'
           ) TO '#{target_parquet_path}' (FORMAT 'PARQUET', OVERWRITE_OR_IGNORE TRUE);
         """
