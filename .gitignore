@@ -24,3 +24,4 @@ ex_logdrain-*.tar
 
 /storage
 .DS_Store
+.env

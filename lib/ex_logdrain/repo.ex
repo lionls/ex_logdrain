@@ -2,7 +2,7 @@ defmodule ExLogdrain.Repo do
   use GenServer
   require Logger
 
-  @db_path Path.expand("storage/logs.duckdb", File.cwd!())
+  @db_path "storage/logs.duckdb"
   @snapshot_interval :timer.minutes(15)
   @expected_columns 30
 
@@ -61,7 +61,7 @@ defmodule ExLogdrain.Repo do
   @impl true
   def init(_opts) do
     Process.flag(:trap_exit, true)
-    File.mkdir_p!(Path.dirname(@db_path))
+    File.mkdir_p!("storage")
 
     {:ok, db} = Duckdbex.open(@db_path)
     {:ok, conn} = Duckdbex.connection(db)
@@ -165,7 +165,7 @@ defmodule ExLogdrain.Repo do
     if bucket do
       "s3://#{bucket}/#{rel}"
     else
-      dir = Path.expand("storage/logs/date=#{date}", File.cwd!())
+      dir = "storage/logs/date=#{date}"
       File.mkdir_p!(dir)
       Path.join(dir, filename)
     end

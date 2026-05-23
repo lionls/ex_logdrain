@@ -1,0 +1,13 @@
+_build/
+deps/
+storage/
+.git/
+test/
+.editorconfig
+.formatter.exs
+.changie.yaml
+.changes/
+CHANGELOG.md
+*.md
+.env
+.vercel/
