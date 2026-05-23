@@ -8,6 +8,7 @@ defmodule ExLogdrain.Application do
   @impl true
   def start(_type, _args) do
     children = [
+      {ExLogdrain.Repo, []},
       {ExLogdrain.LogBuffer, []},
       {Bandit, plug: ExLogdrain.Router, port: 4000}
     ]

@@ -31,9 +31,7 @@ defmodule ExLogdrain.LogBuffer do
   def handle_info(:flush, logs_buffer) do
     Logger.info("Flushing #{length(logs_buffer)} logs to DuckDB...")
 
-    ordered_logs = Enum.reverse(logs_buffer)
-
-    insert_batch_to_duckdb(ordered_logs)
+    ExLogdrain.Repo.insert_batch(Enum.reverse(logs_buffer))
 
     schedule_flush()
     {:noreply, []}
@@ -41,18 +39,6 @@ defmodule ExLogdrain.LogBuffer do
 
   defp schedule_flush do
     seconds = Application.get_env(:ex_logdrain, :flush_interval, 5)
-    interval_ms = :timer.seconds(seconds)
-    Process.send_after(self(), :flush, interval_ms)
-  end
-
-  defp insert_batch_to_duckdb(logs) do
-    IO.puts("Insert Batch")
-
-    Enum.each(logs, fn log ->
-      sql = "INSERT INTO vercel_logs (id, team_id, message, runtime) VALUES ($1, $2, $3, $4);"
-      # DuckDB.query(YourDuckdbRef, sql, [log.id, log.team_id, log.message, log.runtime])
-    end)
-  rescue
-    e -> Logger.error("Failed to flush batch to DuckDB: #{inspect(e)}")
+    Process.send_after(self(), :flush, :timer.seconds(seconds))
   end
 end
