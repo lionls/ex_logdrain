@@ -12,7 +12,6 @@ defmodule ExLogdrain.LogBuffer do
 
   @impl true
   def init(initial_state) do
-    IO.puts(">>> LOG BUFFER GENSERVER HAS STARTED INITIALIZATION <<<")
     schedule_flush()
     {:ok, initial_state}
   end

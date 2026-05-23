@@ -3,11 +3,10 @@ defmodule ExLogdrain.Repo do
   require Logger
 
   @db_path Path.expand("storage/logs.duckdb", File.cwd!())
-  @export_interval :timer.minutes(2)
-  @cleanup_interval :timer.hours(24)
+  @snapshot_interval :timer.minutes(15)
   @expected_columns 30
 
-  @create_sql """
+  @create_table """
   CREATE TABLE vercel_logs (
     id VARCHAR,
     deployment_id VARCHAR,
@@ -71,10 +70,9 @@ defmodule ExLogdrain.Repo do
     {:ok, _} = Duckdbex.query(conn, "SET autoinstall_known_extensions=1;")
     {:ok, _} = Duckdbex.query(conn, "SET autoload_known_extensions=1;")
 
+    configure_s3(conn)
     ensure_table(conn)
-
-    schedule_parquet_export()
-    schedule_database_cleanup()
+    schedule_snapshot()
 
     {:ok, %{db: db, conn: conn}}
   end
@@ -83,68 +81,41 @@ defmodule ExLogdrain.Repo do
   def handle_cast({:insert_batch, []}, state), do: {:noreply, state}
 
   def handle_cast({:insert_batch, logs}, %{conn: conn} = state) do
-    Logger.info("Inserting #{length(logs)} log entries into DuckDB")
-
     try do
       {:ok, appender} = Duckdbex.appender(conn, "vercel_logs")
       Enum.each(logs, fn log ->
         values = Enum.map(@columns, &Map.get(log, &1))
         :ok = Duckdbex.appender_add_row(appender, values)
       end)
-
       :ok = Duckdbex.appender_flush(appender)
       :ok = Duckdbex.appender_close(appender)
     rescue
-      e -> Logger.error("Insert batch failed: #{inspect(e)}")
+      e -> Logger.error("Insert failed: #{inspect(e)}")
     end
 
     {:noreply, state}
   end
 
   @impl true
-  def handle_info(:export_parquet, %{conn: conn} = state) do
-    Logger.info("Exporting Parquet snapshot...")
-
+  def handle_info(:snapshot, %{conn: conn} = state) do
     try do
-      today = Date.utc_today() |> Date.to_string()
-      dir = Path.expand("storage/archive/date=#{today}", File.cwd!())
-      File.mkdir_p!(dir)
-      path = Path.join(dir, "data.parquet")
+      now = DateTime.utc_now()
+      path = snapshot_path(now)
 
       Duckdbex.query(conn, """
-        COPY (
-          SELECT * FROM vercel_logs
-          WHERE epoch_ms(timestamp)::DATE = '#{today}'
-        ) TO '#{path}' (FORMAT 'PARQUET', OVERWRITE_OR_IGNORE TRUE);
+        COPY (SELECT * FROM vercel_logs)
+        TO '#{path}' (FORMAT 'PARQUET');
       """)
 
-      Logger.info("Parquet snapshot written to #{path}")
-    rescue
-      e -> Logger.error("Parquet export failed: #{inspect(e)}")
-    end
-
-    schedule_parquet_export()
-    {:noreply, state}
-  end
-
-  @impl true
-  def handle_info(:cleanup_database, %{conn: conn} = state) do
-    Logger.info("Running database cleanup...")
-
-    try do
-      {:ok, _} =
-        Duckdbex.query(conn, """
-          DELETE FROM vercel_logs
-          WHERE epoch_ms(timestamp) < CURRENT_DATE - INTERVAL 3 DAY;
-        """)
-
+      {:ok, _} = Duckdbex.query(conn, "DELETE FROM vercel_logs;")
       {:ok, _} = Duckdbex.query(conn, "CHECKPOINT;")
-      Logger.info("Cleanup complete")
+
+      Logger.info("Snapshot flushed to #{path}")
     rescue
-      e -> Logger.error("Cleanup failed: #{inspect(e)}")
+      e -> Logger.error("Snapshot failed: #{inspect(e)}")
     end
 
-    schedule_database_cleanup()
+    schedule_snapshot()
     {:noreply, state}
   end
 
@@ -155,6 +126,51 @@ defmodule ExLogdrain.Repo do
     :ok
   end
 
+  defp configure_s3(conn) do
+    bucket = Application.get_env(:ex_logdrain, :s3_bucket)
+    _ = bucket && do_configure_s3(conn)
+  end
+
+  defp do_configure_s3(conn) do
+    {:ok, _} = Duckdbex.query(conn, "INSTALL httpfs;")
+    {:ok, _} = Duckdbex.query(conn, "LOAD httpfs;")
+
+    region = Application.get_env(:ex_logdrain, :s3_region, "us-east-1")
+    key = Application.get_env(:ex_logdrain, :s3_access_key_id, "")
+    secret = Application.get_env(:ex_logdrain, :s3_secret_access_key, "")
+
+    {:ok, _} = Duckdbex.query(conn, "SET s3_region='#{region}';")
+    {:ok, _} = Duckdbex.query(conn, "SET s3_access_key_id='#{key}';")
+    {:ok, _} = Duckdbex.query(conn, "SET s3_secret_access_key='#{secret}';")
+
+    endpoint = Application.get_env(:ex_logdrain, :s3_endpoint)
+    if endpoint do
+      {:ok, _} = Duckdbex.query(conn, "SET s3_endpoint='#{endpoint}';")
+      {:ok, _} = Duckdbex.query(conn, "SET s3_use_ssl=false;")
+      {:ok, _} = Duckdbex.query(conn, "SET s3_url_style='path';")
+    end
+  end
+
+  defp snapshot_path(now) do
+    bucket = Application.get_env(:ex_logdrain, :s3_bucket)
+
+    date = now |> DateTime.to_date() |> Date.to_string()
+    hour = pad(now.hour)
+    minute = pad(now.minute)
+    id = System.unique_integer([:positive]) |> Integer.to_string(36)
+
+    filename = "#{hour}-#{minute}_#{id}.parquet"
+    rel = "logs/date=#{date}/#{filename}"
+
+    if bucket do
+      "s3://#{bucket}/#{rel}"
+    else
+      dir = Path.expand("storage/logs/date=#{date}", File.cwd!())
+      File.mkdir_p!(dir)
+      Path.join(dir, filename)
+    end
+  end
+
   defp ensure_table(conn) do
     {:ok, _} = Duckdbex.query(conn, "CREATE TABLE IF NOT EXISTS vercel_logs (id VARCHAR);")
 
@@ -162,20 +178,15 @@ defmodule ExLogdrain.Repo do
     rows = Duckdbex.fetch_all(result)
 
     if length(rows) != @expected_columns do
-      Logger.info(
-        "Schema drift detected (#{length(rows)} cols, expected #{@expected_columns}), recreating..."
-      )
-
+      Logger.info("Schema drift (#{length(rows)} cols, expected #{@expected_columns}), recreating...")
       {:ok, _} = Duckdbex.query(conn, "DROP TABLE vercel_logs;")
-      {:ok, _} = Duckdbex.query(conn, @create_sql)
+      {:ok, _} = Duckdbex.query(conn, @create_table)
     end
   end
 
-  defp schedule_parquet_export do
-    Process.send_after(self(), :export_parquet, @export_interval)
+  defp schedule_snapshot do
+    Process.send_after(self(), :snapshot, @snapshot_interval)
   end
 
-  defp schedule_database_cleanup do
-    Process.send_after(self(), :cleanup_database, @cleanup_interval)
-  end
+  defp pad(n), do: String.pad_leading(Integer.to_string(n), 2, "0")
 end
