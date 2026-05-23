@@ -3,9 +3,53 @@ defmodule ExLogdrain.Repo do
   require Logger
 
   @db_path Path.expand("storage/logs.duckdb", File.cwd!())
-
   @export_interval :timer.minutes(2)
   @cleanup_interval :timer.hours(24)
+  @expected_columns 30
+
+  @create_sql """
+  CREATE TABLE vercel_logs (
+    id VARCHAR,
+    deployment_id VARCHAR,
+    source VARCHAR,
+    host VARCHAR,
+    timestamp BIGINT,
+    project_id VARCHAR,
+    level VARCHAR,
+    message VARCHAR,
+    project_name VARCHAR,
+    build_id VARCHAR,
+    type VARCHAR,
+    entrypoint VARCHAR,
+    request_id VARCHAR,
+    status_code INTEGER,
+    path VARCHAR,
+    execution_region VARCHAR,
+    environment VARCHAR,
+    trace_id VARCHAR,
+    span_id VARCHAR,
+    proxy_timestamp BIGINT,
+    proxy_method VARCHAR,
+    proxy_host VARCHAR,
+    proxy_path VARCHAR,
+    proxy_user_agent VARCHAR,
+    proxy_referer VARCHAR,
+    proxy_region VARCHAR,
+    proxy_status_code INTEGER,
+    proxy_client_ip VARCHAR,
+    proxy_scheme VARCHAR,
+    proxy_vercel_cache VARCHAR
+  );
+  """
+
+  @columns [
+    :id, :deployment_id, :source, :host, :timestamp, :project_id,
+    :level, :message, :project_name, :build_id, :type, :entrypoint, :request_id,
+    :status_code, :path, :execution_region, :environment, :trace_id, :span_id,
+    :proxy_timestamp, :proxy_method, :proxy_host, :proxy_path, :proxy_user_agent,
+    :proxy_referer, :proxy_region, :proxy_status_code, :proxy_client_ip,
+    :proxy_scheme, :proxy_vercel_cache
+  ]
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -14,8 +58,6 @@ defmodule ExLogdrain.Repo do
   def insert_batch(logs) do
     GenServer.cast(__MODULE__, {:insert_batch, logs})
   end
-
-  def get_connection, do: GenServer.call(__MODULE__, :get_connection)
 
   @impl true
   def init(_opts) do
@@ -26,50 +68,10 @@ defmodule ExLogdrain.Repo do
     {:ok, conn} = Duckdbex.connection(db)
 
     {:ok, _} = Duckdbex.query(conn, "SET memory_limit = '256MB';")
-
     {:ok, _} = Duckdbex.query(conn, "SET autoinstall_known_extensions=1;")
     {:ok, _} = Duckdbex.query(conn, "SET autoload_known_extensions=1;")
 
-    {:ok, _result_ref} =
-      Duckdbex.query(
-        conn,
-        """
-        CREATE TABLE IF NOT EXISTS vercel_logs (
-          id VARCHAR,
-          deployment_id VARCHAR,
-          source VARCHAR,
-          host VARCHAR,
-          timestamp BIGINT,
-          project_id VARCHAR,
-          level VARCHAR,
-          message VARCHAR,
-          project_name VARCHAR,
-          build_id VARCHAR,
-          type VARCHAR,
-          entrypoint VARCHAR,
-          request_id VARCHAR,
-          status_code INTEGER,
-          path VARCHAR,
-          execution_region VARCHAR,
-          environment VARCHAR,
-          trace_id VARCHAR,
-          span_id VARCHAR,
-          proxy_timestamp BIGINT,
-          proxy_method VARCHAR,
-          proxy_host VARCHAR,
-          proxy_path VARCHAR,
-          proxy_user_agent VARCHAR,
-          proxy_referer VARCHAR,
-          proxy_region VARCHAR,
-          proxy_status_code INTEGER,
-          proxy_client_ip VARCHAR,
-          proxy_scheme VARCHAR,
-          proxy_vercel_cache VARCHAR,
-          inserted_at TIMESTAMPTZ
-        );
-        """
-        |> String.trim()
-      )
+    ensure_table(conn)
 
     schedule_parquet_export()
     schedule_database_cleanup()
@@ -78,62 +80,22 @@ defmodule ExLogdrain.Repo do
   end
 
   @impl true
-  def handle_call(:get_connection, _from, state) do
-    {:reply, {:ok, state.db, state.conn}, state}
-  end
-
-  @impl true
   def handle_cast({:insert_batch, []}, state), do: {:noreply, state}
 
   def handle_cast({:insert_batch, logs}, %{conn: conn} = state) do
-    Logger.info("Repo Database Worker: Committing #{length(logs)} records natively to disk...")
+    Logger.info("Inserting #{length(logs)} log entries into DuckDB")
 
     try do
       {:ok, appender} = Duckdbex.appender(conn, "vercel_logs")
-
-      now = DateTime.utc_now()
-
       Enum.each(logs, fn log ->
-        :ok =
-          Duckdbex.appender_add_row(appender, [
-            log.id,
-            log.deployment_id,
-            log.source,
-            log.host,
-            log.timestamp,
-            log.project_id,
-            log.level,
-            log.message,
-            log.project_name,
-            log.build_id,
-            log.type,
-            log.entrypoint,
-            log.request_id,
-            log.status_code,
-            log.path,
-            log.execution_region,
-            log.environment,
-            log.trace_id,
-            log.span_id,
-            log.proxy_timestamp,
-            log.proxy_method,
-            log.proxy_host,
-            log.proxy_path,
-            log.proxy_user_agent,
-            log.proxy_referer,
-            log.proxy_region,
-            log.proxy_status_code,
-            log.proxy_client_ip,
-            log.proxy_scheme,
-            log.proxy_vercel_cache,
-            now
-          ])
+        values = Enum.map(@columns, &Map.get(log, &1))
+        :ok = Duckdbex.appender_add_row(appender, values)
       end)
 
       :ok = Duckdbex.appender_flush(appender)
       :ok = Duckdbex.appender_close(appender)
     rescue
-      e -> Logger.error("Critical: Disk writer operation aborted: #{inspect(e)}")
+      e -> Logger.error("Insert batch failed: #{inspect(e)}")
     end
 
     {:noreply, state}
@@ -141,30 +103,24 @@ defmodule ExLogdrain.Repo do
 
   @impl true
   def handle_info(:export_parquet, %{conn: conn} = state) do
-    Logger.info("Repo Database Worker: Generating background Parquet snapshot...")
+    Logger.info("Exporting Parquet snapshot...")
 
     try do
-      today_str = Date.utc_today() |> Date.to_string()
+      today = Date.utc_today() |> Date.to_string()
+      dir = Path.expand("storage/archive/date=#{today}", File.cwd!())
+      File.mkdir_p!(dir)
+      path = Path.join(dir, "data.parquet")
 
-      partition_dir = Path.expand("storage/archive/date=#{today_str}", File.cwd!())
-      File.mkdir_p!(partition_dir)
+      Duckdbex.query(conn, """
+        COPY (
+          SELECT * FROM vercel_logs
+          WHERE epoch_ms(timestamp)::DATE = '#{today}'
+        ) TO '#{path}' (FORMAT 'PARQUET', OVERWRITE_OR_IGNORE TRUE);
+      """)
 
-      target_parquet_path = Path.join(partition_dir, "data.parquet")
-
-      Duckdbex.query(
-        conn,
-        """
-          COPY (
-            SELECT * FROM vercel_logs
-            WHERE CAST(inserted_at AS DATE) = '#{today_str}'
-          ) TO '#{target_parquet_path}' (FORMAT 'PARQUET', OVERWRITE_OR_IGNORE TRUE);
-        """
-        |> String.trim()
-      )
-
-      Logger.info("Repo Database Worker: Snapshot successfully written to #{target_parquet_path}")
+      Logger.info("Parquet snapshot written to #{path}")
     rescue
-      e -> Logger.error("Failed to export partitioned Parquet snapshot: #{inspect(e)}")
+      e -> Logger.error("Parquet export failed: #{inspect(e)}")
     end
 
     schedule_parquet_export()
@@ -173,24 +129,19 @@ defmodule ExLogdrain.Repo do
 
   @impl true
   def handle_info(:cleanup_database, %{conn: conn} = state) do
-    Logger.info("Repo Maintenance: Starting automated rolling data truncation...")
+    Logger.info("Running database cleanup...")
 
     try do
       {:ok, _} =
-        Duckdbex.query(
-          conn,
-          """
-            DELETE FROM vercel_logs
-            WHERE inserted_at < CURRENT_DATE - INTERVAL 3 DAY;
-          """
-          |> String.trim()
-        )
+        Duckdbex.query(conn, """
+          DELETE FROM vercel_logs
+          WHERE epoch_ms(timestamp) < CURRENT_DATE - INTERVAL 3 DAY;
+        """)
 
       {:ok, _} = Duckdbex.query(conn, "CHECKPOINT;")
-
-      Logger.info("Repo Maintenance: Database cleanup and space optimization complete.")
+      Logger.info("Cleanup complete")
     rescue
-      e -> Logger.error("Repo Maintenance: Cleanup routine failed: #{inspect(e)}")
+      e -> Logger.error("Cleanup failed: #{inspect(e)}")
     end
 
     schedule_database_cleanup()
@@ -199,10 +150,25 @@ defmodule ExLogdrain.Repo do
 
   @impl true
   def terminate(_reason, %{conn: conn, db: db}) do
-    Logger.info("Gracefully releasing persistent DuckDB disk assets...")
     Duckdbex.release(conn)
     Duckdbex.release(db)
     :ok
+  end
+
+  defp ensure_table(conn) do
+    {:ok, _} = Duckdbex.query(conn, "CREATE TABLE IF NOT EXISTS vercel_logs (id VARCHAR);")
+
+    {:ok, result} = Duckdbex.query(conn, "PRAGMA table_info('vercel_logs');")
+    rows = Duckdbex.fetch_all(result)
+
+    if length(rows) != @expected_columns do
+      Logger.info(
+        "Schema drift detected (#{length(rows)} cols, expected #{@expected_columns}), recreating..."
+      )
+
+      {:ok, _} = Duckdbex.query(conn, "DROP TABLE vercel_logs;")
+      {:ok, _} = Duckdbex.query(conn, @create_sql)
+    end
   end
 
   defp schedule_parquet_export do
