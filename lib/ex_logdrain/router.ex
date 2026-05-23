@@ -49,7 +49,7 @@ defmodule ExLogdrain.Router do
       timestamp: log["timestamp"],
       project_id: log["projectId"],
       level: log["level"],
-      message: log["message"],
+      message: normalize_message(log["message"]),
       project_name: log["projectName"],
       build_id: log["buildId"],
       type: log["type"],
@@ -78,4 +78,17 @@ defmodule ExLogdrain.Router do
   defp encode_user_agent(nil), do: nil
   defp encode_user_agent(ua) when is_list(ua), do: ExLogdrain.Json.encode(ua)
   defp encode_user_agent(ua), do: ua
+
+  defp normalize_message(msg) when is_binary(msg) do
+    case ExLogdrain.Json.try_decode(msg) do
+      parsed when is_map(parsed) or is_list(parsed) ->
+        ExLogdrain.Json.encode(parsed)
+
+      _ ->
+        ExLogdrain.Json.encode(%{"raw" => msg})
+    end
+  end
+
+  defp normalize_message(nil), do: nil
+  defp normalize_message(msg), do: ExLogdrain.Json.encode(%{"raw" => to_string(msg)})
 end
