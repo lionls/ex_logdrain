@@ -5,6 +5,6 @@ defmodule ExLogdrain.Json do
   def decode!(body, _opts), do: :json.decode(body)
 
   def encode(value) do
-    :json.encode(value)
+    :json.encode(value) |> IO.iodata_to_binary()
   end
 end
